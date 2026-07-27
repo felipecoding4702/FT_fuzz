@@ -9,6 +9,8 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -20,7 +22,7 @@ type Result struct {
 }
 
 type Progress struct {
-	done     int
+	done     atomic.Int64 // requests completed — atomic: read by the progress goroutine without the lock
 	maxReqs  int
 	maxDepth int
 	results  []Result
@@ -35,7 +37,7 @@ func (p *Progress) drawBar() {
 	const barWidth = 40
 	pct := 0.0
 	if p.maxReqs > 0 {
-		pct = float64(p.done) / float64(p.maxReqs)
+		pct = float64(p.done.Load()) / float64(p.maxReqs)
 	}
 	if pct > 1 {
 		pct = 1
@@ -43,7 +45,7 @@ func (p *Progress) drawBar() {
 	filled := int(pct * float64(barWidth))
 	bar := strings.Repeat("█", filled) + strings.Repeat("░", barWidth-filled)
 	// \033[K clears any trailing leftovers so shorter lines don't smudge.
-	fmt.Printf("\r[%s] %5.1f%% (%d/%d) \033[K", bar, pct*100, p.done, p.maxReqs)
+	fmt.Printf("\r[%s] %5.1f%% (%d/%d) \033[K", bar, pct*100, p.done.Load(), p.maxReqs)
 }
 
 func openWordlist(path string) *os.File {
@@ -202,7 +204,7 @@ func printPlan(minReqs, maxReqs, threads int, rtt, expected time.Duration) {
 	}
 	fmt.Printf("\n%s SCAN PLAN %s\n", cBold, cReset)
 	fmt.Println("  ───────────────────────────────────────────")
-	fmt.Printf("  %-16s %d\n", "Min requests", minReqs)
+	fmt.Printf("  %-16s %d\n", "Word List Size", minReqs)
 	fmt.Printf("  %-16s %d\n", "Max requests", maxReqs)
 	fmt.Printf("  %-16s %d\n", "Threads", threads)
 	fmt.Printf("  %-16s %s   (avg RTT %s)\n", "Expected time", expStr, rttStr)
@@ -210,45 +212,121 @@ func printPlan(minReqs, maxReqs, threads int, rtt, expected time.Duration) {
 	fmt.Println()
 }
 
-func scan(client *http.Client, base string, words []string, p *Progress) {
+func scan(client *http.Client, base string, words []string, p *Progress, threads int) {
 	/*
-		Unified breadth-first scan. A work queue holds URLs to probe; each
-		probed URL that answers 200 or 403 enqueues its own children so the
-		search descends until maxDepth. Results are collected silently and
-		rendered into tables once the scan finishes.
+		Concurrent scan. A shared work queue holds individual URLs to probe;
+		`threads` workers pop URLs, fire requests, and enqueue the children of
+		any URL that answers 200 or 403, descending until maxDepth. Because
+		work is discovered on the fly, there is no fixed job list — termination
+		relies on the condition "queue empty AND no worker mid-flight".
 
-		The queue shape is what a future worker pool will drain, so wiring in
-		threads later only changes how items are popped — not this structure.
+		Guarding the shared state:
+		  - mu protects queue, visited and results.
+		  - done is atomic, so the progress goroutine reads it without the lock.
+		  - cond wakes idle workers whenever the queue or the in-flight count
+		    changes, so no worker sleeps past new work or past shutdown.
 	*/
-	type item struct {
+	if threads < 1 {
+		threads = 1
+	}
+	if p.maxDepth < 1 {
+		return
+	}
+
+	type job struct {
 		url   string
 		depth int
 	}
-	visited := map[string]bool{base: true}
-	queue := []item{{base, 0}}
 
-	for len(queue) > 0 {
-		cur := queue[0]
-		queue = queue[1:]
-		if cur.depth >= p.maxDepth {
-			continue
-		}
-		for _, word := range words {
-			url := cur.url + "/" + word
-			if visited[url] {
-				continue
-			}
-			visited[url] = true
-			status, body := probe(client, url)
-			pts := score(status, body)
-			p.results = append(p.results, Result{url, status, len(body), pts})
-			p.done++
-			p.drawBar()
-			if status == 200 || status == 403 {
-				queue = append(queue, item{url, cur.depth + 1})
-			}
+	var mu sync.Mutex
+	cond := sync.NewCond(&mu)
+	queue := []job{}
+	visited := map[string]bool{}
+	active := 0 // workers currently between "popped a job" and "finished recording it"
+
+	// Seed: enqueue the target's direct children (depth 1). The base itself is
+	// never probed — it's just the root we grow the tree from.
+	mu.Lock()
+	for _, w := range words {
+		u := base + "/" + w
+		if !visited[u] {
+			visited[u] = true
+			queue = append(queue, job{u, 1})
 		}
 	}
+	mu.Unlock()
+
+	worker := func() {
+		for {
+			mu.Lock()
+			for len(queue) == 0 {
+				if active == 0 {
+					// Nothing pending and nothing in flight that could add more: done.
+					cond.Broadcast() // release any other sleepers so they exit too
+					mu.Unlock()
+					return
+				}
+				cond.Wait()
+			}
+			j := queue[0]
+			queue = queue[1:]
+			active++
+			mu.Unlock()
+
+			// Network I/O happens outside the lock so other workers stay busy.
+			status, body := probe(client, j.url)
+			pts := score(status, body)
+			p.done.Add(1)
+
+			mu.Lock()
+			p.results = append(p.results, Result{j.url, status, len(body), pts})
+			if (status == 200 || status == 403) && j.depth < p.maxDepth {
+				for _, w := range words {
+					child := j.url + "/" + w
+					if !visited[child] {
+						visited[child] = true
+						queue = append(queue, job{child, j.depth + 1})
+					}
+				}
+			}
+			active--
+			cond.Broadcast() // new work may exist, or we may have hit the end
+			mu.Unlock()
+		}
+	}
+
+	// One dedicated goroutine redraws the bar off the atomic counter, so workers
+	// never touch stdout and there's no interleaving/tearing.
+	stop := make(chan struct{})
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+		p.drawBar()
+		t := time.NewTicker(100 * time.Millisecond)
+		defer t.Stop()
+		for {
+			select {
+			case <-stop:
+				p.drawBar()
+				return
+			case <-t.C:
+				p.drawBar()
+			}
+		}
+	}()
+
+	var wg sync.WaitGroup
+	for i := 0; i < threads; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			worker()
+		}()
+	}
+	wg.Wait()
+
+	close(stop)
+	<-finished
 }
 
 // ANSI colors used to make the result tables readable at a glance.
@@ -324,11 +402,15 @@ func main() {
 	wordlist := flag.String("l", "", "Path to wordlist file")
 	target := flag.String("u", "", "Target URL (e.g. http://example.com)")
 	depth := flag.Int("depth", 3, "Max recursion depth")
+	threads := flag.Int("t", 10, "Number of concurrent workers")
 	flag.Parse()
 
 	if *wordlist == "" || *target == "" {
-		fmt.Println("Usage: ft-fuzz -u <url> -l <wordlist> [-depth N]")
+		fmt.Println("Usage: ft-fuzz -u <url> -l <wordlist> [-depth N] [-t N]")
 		os.Exit(1)
+	}
+	if *threads < 1 {
+		*threads = 1
 	}
 
 	file := openWordlist(*wordlist)
@@ -346,15 +428,14 @@ func main() {
 	client := &http.Client{}
 
 	rtt := measureRTT(client, base)
-	threads := 1 // parallel requests land in a later step; the estimate divides by this already.
 	expectedReqs := (maxReqs + minReqs) / 2
-	expectedTime := time.Duration(float64(expectedReqs) * float64(rtt) / float64(threads))
+	expectedTime := time.Duration(float64(expectedReqs) * float64(rtt) / float64(*threads))
 
-	printPlan(minReqs, maxReqs, threads, rtt, expectedTime)
+	printPlan(minReqs, maxReqs, *threads, rtt, expectedTime)
 
 	p := &Progress{maxReqs: maxReqs, maxDepth: *depth}
-	scan(client, base, words, p)
+	scan(client, base, words, p, *threads)
 
-	fmt.Printf("\r\033[KDone. Total requests: %d\n\n", p.done)
+	fmt.Printf("\r\033[KDone. Total requests: %d\n\n", p.done.Load())
 	p.renderTables()
 }
