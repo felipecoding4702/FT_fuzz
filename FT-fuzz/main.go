@@ -9,6 +9,7 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"time"
 )
 
 type Result struct {
@@ -21,44 +22,29 @@ type Result struct {
 type Progress struct {
 	done     int
 	maxReqs  int
-	depth    int
 	maxDepth int
-	drawn    bool
 	results  []Result
 }
 
-func (p *Progress) print(url string, status, size int, pts float64, isResult bool) {
+func (p *Progress) drawBar() {
 	/*
-		Function related to the printing stage of the tool.
-		Both controlling the advance of the percetage Bar such as the current node printing
+		Draws a single progress bar in place (carriage return, no new lines),
+		overwriting itself each call. Kept deliberately minimal: just the bar,
+		percentage and request counter.
 	*/
-
-	if p.drawn {
-		fmt.Print("\033[1A\033[2K\r\033[1A\033[2K\r")
-		p.drawn = false
+	const barWidth = 40
+	pct := 0.0
+	if p.maxReqs > 0 {
+		pct = float64(p.done) / float64(p.maxReqs)
 	}
-	if isResult {
-		if status == 0 {
-			fmt.Printf("%-60s  ERROR\n", url)
-		} else {
-			fmt.Printf("%-60s  %d  (%d bytes)  [%.3f pts]\n", url, status, size, pts)
-		}
-		p.done++
+	if pct > 1 {
+		pct = 1
 	}
-	if url != "" {
-		const barWidth = 40
-		pct := 0.0
-		if p.maxReqs > 0 {
-			pct = float64(p.done) / float64(p.maxReqs)
-		}
-		filled := int(pct * float64(barWidth))
-		bar := strings.Repeat("█", filled) + strings.Repeat("░", barWidth-filled)
-		fmt.Printf("Testing : %-70s\n[%s] %5.1f%% (%d/%d) | depth %d/%d\n",
-			url, bar, pct*100, p.done, p.maxReqs, p.depth, p.maxDepth)
-		p.drawn = true
-	}
+	filled := int(pct * float64(barWidth))
+	bar := strings.Repeat("█", filled) + strings.Repeat("░", barWidth-filled)
+	// \033[K clears any trailing leftovers so shorter lines don't smudge.
+	fmt.Printf("\r[%s] %5.1f%% (%d/%d) \033[K", bar, pct*100, p.done, p.maxReqs)
 }
-
 
 func openWordlist(path string) *os.File {
 	/*
@@ -127,20 +113,30 @@ func score(status int, body string) float64 {
 	return codePoint * keywordPoint * bodyPoint
 }
 
-func probe(client *http.Client, url string) (int, string) {
+func newRequest(url string) (*http.Request, error) {
 	/*
-		Setting up the HTTP Client given its pointer, so that we can set up Headers that disguises the nature of a bot.
-		Probing the connection, and retriving both the Status Code and the response body.
+		Builds a GET request with browser-like headers so the traffic looks
+		like a real client instead of Go's default bot UA. Shared by probe()
+		and the RTT calibration so they behave identically.
 	*/
-
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
-		return 0, ""
+		return nil, err
 	}
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36")
 	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
 	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
+	return req, nil
+}
 
+func probe(client *http.Client, url string) (int, string) {
+	/*
+		Probing the connection, and retriving both the Status Code and the response body.
+	*/
+	req, err := newRequest(url)
+	if err != nil {
+		return 0, ""
+	}
 	resp, err := client.Do(req)
 	if err != nil {
 		return 0, ""
@@ -150,60 +146,106 @@ func probe(client *http.Client, url string) (int, string) {
 	return resp.StatusCode, string(body)
 }
 
-func dfs_scan(client *http.Client, base string, words []string, visited map[string]bool, p *Progress, depth int) {
+func measureRTT(client *http.Client, url string) time.Duration {
 	/*
-		DFS(Depth First Search) algorithm that utilizes a recursive fucntion to probe further connections when status Code is either 200 or 403
-		and having as stoping poitn both Status Code 404, 302... or The depth of the search
+		Fires a few warm-up requests at the base URL and returns the average
+		round-trip time. Used to estimate total scan time. Returns 0 if every
+		sample failed (e.g. host unreachable), which the caller treats as "n/a".
 	*/
-	if depth >= p.maxDepth {
-		return
-	}
-	for _, word := range words {
-		url := base + "/" + word
-		if visited[url] {
+	const samples = 3
+	var total time.Duration
+	hit := 0
+	for i := 0; i < samples; i++ {
+		req, err := newRequest(url)
+		if err != nil {
 			continue
 		}
-		visited[url] = true
-		p.depth = depth + 1
-		p.print(url, 0, 0, 0, false)
-		status, body := probe(client, url)
-		pts := score(status, body)
-		p.results = append(p.results, Result{url, status, len(body), pts})
-		p.print(url, status, len(body), pts, true)
-		if status == 200 || status == 403 {
-			dfs_scan(client, url, words, visited, p, depth+1)
-			p.depth = depth + 1
+		start := time.Now()
+		resp, err := client.Do(req)
+		if err != nil {
+			continue
 		}
+		io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+		total += time.Since(start)
+		hit++
+	}
+	if hit == 0 {
+		return 0
+	}
+	return total / time.Duration(hit)
+}
+
+func formatDuration(d time.Duration) string {
+	switch {
+	case d < time.Second:
+		return fmt.Sprintf("%d ms", d.Milliseconds())
+	case d < time.Minute:
+		return fmt.Sprintf("%.1f s", d.Seconds())
+	case d < time.Hour:
+		return fmt.Sprintf("%.1f min", d.Minutes())
+	default:
+		return fmt.Sprintf("%.1f h", d.Hours())
 	}
 }
 
-func bfs_scan(client *http.Client, base string, words []string, p *Progress) {
+func printPlan(minReqs, maxReqs, threads int, rtt, expected time.Duration) {
+	/*
+		The static "SCAN PLAN" table shown once before the scan starts:
+		min/max request estimates, thread count and the expected wall-clock
+		time derived from the measured average RTT.
+	*/
+	rttStr, expStr := "n/a", "n/a"
+	if rtt > 0 {
+		rttStr = formatDuration(rtt)
+		expStr = "~" + formatDuration(expected)
+	}
+	fmt.Printf("\n%s SCAN PLAN %s\n", cBold, cReset)
+	fmt.Println("  ───────────────────────────────────────────")
+	fmt.Printf("  %-16s %d\n", "Min requests", minReqs)
+	fmt.Printf("  %-16s %d\n", "Max requests", maxReqs)
+	fmt.Printf("  %-16s %d\n", "Threads", threads)
+	fmt.Printf("  %-16s %s   (avg RTT %s)\n", "Expected time", expStr, rttStr)
+	fmt.Println("  ───────────────────────────────────────────")
+	fmt.Println()
+}
+
+func scan(client *http.Client, base string, words []string, p *Progress) {
+	/*
+		Unified breadth-first scan. A work queue holds URLs to probe; each
+		probed URL that answers 200 or 403 enqueues its own children so the
+		search descends until maxDepth. Results are collected silently and
+		rendered into tables once the scan finishes.
+
+		The queue shape is what a future worker pool will drain, so wiring in
+		threads later only changes how items are popped — not this structure.
+	*/
 	type item struct {
 		url   string
 		depth int
 	}
 	visited := map[string]bool{base: true}
 	queue := []item{{base, 0}}
+
 	for len(queue) > 0 {
-		current := queue[0]
+		cur := queue[0]
 		queue = queue[1:]
-		if current.depth >= p.maxDepth {
+		if cur.depth >= p.maxDepth {
 			continue
 		}
 		for _, word := range words {
-			url := current.url + "/" + word
+			url := cur.url + "/" + word
 			if visited[url] {
 				continue
 			}
 			visited[url] = true
-			p.depth = current.depth + 1
-			p.print(url, 0, 0, 0, false)
 			status, body := probe(client, url)
 			pts := score(status, body)
 			p.results = append(p.results, Result{url, status, len(body), pts})
-			p.print(url, status, len(body), pts, true)
+			p.done++
+			p.drawBar()
 			if status == 200 || status == 403 {
-				queue = append(queue, item{url, current.depth + 1})
+				queue = append(queue, item{url, cur.depth + 1})
 			}
 		}
 	}
@@ -281,13 +323,11 @@ func (p *Progress) renderTables() {
 func main() {
 	wordlist := flag.String("l", "", "Path to wordlist file")
 	target := flag.String("u", "", "Target URL (e.g. http://example.com)")
-	dfs := flag.Bool("dfs", false, "Depth-first scan")
-	bfs := flag.Bool("bfs", false, "Breadth-first scan")
 	depth := flag.Int("depth", 3, "Max recursion depth")
 	flag.Parse()
 
-	if *wordlist == "" || *target == "" || (!*dfs && !*bfs) {
-		fmt.Println("Usage: ft-fuzz -u <url> -l <wordlist> [--dfs|--bfs] [-depth N]")
+	if *wordlist == "" || *target == "" {
+		fmt.Println("Usage: ft-fuzz -u <url> -l <wordlist> [-depth N]")
 		os.Exit(1)
 	}
 
@@ -301,20 +341,20 @@ func main() {
 		maxReqs += level
 		level *= len(words)
 	}
-	fmt.Printf("Wordlist: %d words | depth: %d | min: %d requests | max (worst case): %d requests\n\n",
-		len(words), *depth, minReqs, maxReqs)
 
 	base := strings.TrimRight(*target, "/")
 	client := &http.Client{}
+
+	rtt := measureRTT(client, base)
+	threads := 1 // parallel requests land in a later step; the estimate divides by this already.
+	expectedReqs := (maxReqs + minReqs) / 2
+	expectedTime := time.Duration(float64(expectedReqs) * float64(rtt) / float64(threads))
+
+	printPlan(minReqs, maxReqs, threads, rtt, expectedTime)
+
 	p := &Progress{maxReqs: maxReqs, maxDepth: *depth}
+	scan(client, base, words, p)
 
-	if *dfs {
-		dfs_scan(client, base, words, map[string]bool{}, p, 0)
-	} else {
-		bfs_scan(client, base, words, p)
-	}
-
-	p.print("", 0, 0, 0, false)
-	fmt.Printf("\nDone. Total requests: %d\n", p.done)
+	fmt.Printf("\r\033[KDone. Total requests: %d\n\n", p.done)
 	p.renderTables()
 }
