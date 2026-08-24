@@ -191,7 +191,7 @@ func formatDuration(d time.Duration) string {
 	}
 }
 
-func printPlan(minReqs, maxReqs, threads int, rtt, expected time.Duration) {
+func printPlan(minReqs, maxReqs, threads int, rtt, expected time.Duration, recursive bool, depth int, wordlist string) {
 	/*
 		The static "SCAN PLAN" table shown once before the scan starts:
 		min/max request estimates, thread count and the expected wall-clock
@@ -202,13 +202,20 @@ func printPlan(minReqs, maxReqs, threads int, rtt, expected time.Duration) {
 		rttStr = formatDuration(rtt)
 		expStr = "~" + formatDuration(expected)
 	}
-	fmt.Printf("\n%s SCAN PLAN %s\n", cBold, cReset)
-	fmt.Println("  ───────────────────────────────────────────")
-	fmt.Printf("  %-16s %d\n", "Word List Size", minReqs)
-	fmt.Printf("  %-16s %d\n", "Max requests", maxReqs)
-	fmt.Printf("  %-16s %d\n", "Threads", threads)
-	fmt.Printf("  %-16s %s   (avg RTT %s)\n", "Expected time", expStr, rttStr)
-	fmt.Println("  ───────────────────────────────────────────")
+	fmt.Printf("\n%s%s%s SCAN PLAN %s\n", cBold, cGreen, cReset, cReset)
+	fmt.Printf("  %s%s%s\n", cGreen, strings.Repeat("─", 120), cReset)
+	fmt.Printf("  %-20s\t\t\t\t\t\t\t\t\t%s\n", "Scan Wordlist", wordlist)
+	fmt.Printf("  %-20s\t\t\t\t\t\t\t\t\t%s\n", "Highlighted Wordlist", "(not implemented)")
+	fmt.Printf("  %-20s\t\t\t\t\t\t\t\t\t%d\n", "Word List Size", minReqs)
+	fmt.Printf("  %-20s\t\t\t\t\t\t\t\t\t%d\n", "Max requests", maxReqs)
+	fmt.Printf("  %-20s\t\t\t\t\t\t\t\t\t%d\n", "Threads", threads)
+	if recursive {
+		fmt.Printf("  %-20s\t\t\t\t\t\t\t\t\t%s (depth: %d)\n", "Mode", "Recursive", depth)
+	} else {
+		fmt.Printf("  %-20s\t\t\t\t\t\t\t\t\t%s\n", "Mode", "Single-level")
+	}
+	fmt.Printf("  %-20s\t\t\t\t\t\t\t\t\t%s   (avg RTT: %s)\n", "Expected time", expStr, rttStr)
+	fmt.Printf("  %s%s%s\n", cGreen, strings.Repeat("─", 120), cReset)
 	fmt.Println()
 }
 
@@ -339,89 +346,244 @@ const (
 	cGray   = "\033[90m"
 )
 
-func printTable(title, color string, rows []Result) {
+func statusLabel(status int) string {
 	/*
-		Renders one result table: a coloured header followed by every row,
-		showing the URL, status code, body size and the computed points.
+		Returns a human-readable label for HTTP status codes.
 	*/
-	fmt.Printf("\n%s%s%s (%d)%s\n", cBold, color, title, len(rows), cReset)
-	fmt.Printf("  %-60s  %-5s  %-10s  %s\n", "URL", "CODE", "SIZE", "POINTS")
-	if len(rows) == 0 {
-		fmt.Println("  (none)")
-		return
+	switch status {
+	case 200:
+		return "200 OK"
+	case 301:
+		return "301 Moved Permanently"
+	case 302:
+		return "302 Found"
+	case 303:
+		return "303 See Other"
+	case 307:
+		return "307 Temporary Redirect"
+	case 308:
+		return "308 Permanent Redirect"
+	case 403:
+		return "403 Forbidden"
+	case 404:
+		return "404 Not Found"
+	default:
+		return fmt.Sprintf("%d", status)
 	}
-	for _, r := range rows {
-		fmt.Printf("  %s%-60s  %-5d  %-10d  %.4f%s\n", color, r.url, r.status, r.size, r.points, cReset)
+}
+
+func statusColor(status int) string {
+	/*
+		Returns the color code for a given HTTP status.
+	*/
+	switch status {
+	case 200:
+		return cGreen
+	case 301, 302, 303, 307, 308:
+		return cYellow
+	case 403:
+		return cRed
+	case 404:
+		return cGray
+	default:
+		return cReset
 	}
 }
 
 func (p *Progress) renderTables() {
 	/*
-		Sorts every probed URL by points (desc). The 15 highest go to the
-		"Highlighted" table; the remainder are bucketed by status code into
-		the 200 / 302 / 403 / 404 tables.
+		Renders results as a side-by-side table with fixed columns:
+		Highlighted, 200 OK, 302 Found, 403 Forbidden, 404 Not Found.
+		Each entry shows "url(Points)" format.
+		Shows up to 40 rows with overflow indicator per column.
 	*/
+	const maxRows = 40
+
+	// Sort all results by points (descending)
 	sort.SliceStable(p.results, func(i, j int) bool {
 		return p.results[i].points > p.results[j].points
 	})
 
-	// Highlight at most 15 URLs, and only ones that actually scored points.
-	// Everything else (including zero-point hits) falls through to its
-	// status-code table.
-	var highlighted, rest []Result
+	// Highlighted: top 15 with points > 0
+	var highlighted []Result
 	for _, r := range p.results {
 		if r.points > 0 && len(highlighted) < 15 {
 			highlighted = append(highlighted, r)
-		} else {
-			rest = append(rest, r)
 		}
 	}
 
-	var t200, t302, t403, t404 []Result
-	for _, r := range rest {
-		switch r.status {
-		case 200:
-			t200 = append(t200, r)
-		case 302:
-			t302 = append(t302, r)
-		case 403:
-			t403 = append(t403, r)
-		case 404:
-			t404 = append(t404, r)
+	// Group the rest by status code
+	statusGroups := make(map[int][]Result)
+	seen := make(map[string]bool) // track which URLs are in highlighted
+	for _, r := range highlighted {
+		seen[r.url] = true
+	}
+	for _, r := range p.results {
+		if !seen[r.url] {
+			statusGroups[r.status] = append(statusGroups[r.status], r)
 		}
 	}
 
-	printTable("HIGHLIGHTED — top 15 by points", cYellow, highlighted)
-	printTable("200 OK", cGreen, t200)
-	printTable("302 Redirect", cYellow, t302)
-	printTable("403 Forbidden", cRed, t403)
-	printTable("404 Not Found", cGray, t404)
+	// Build fixed columns: Highlighted, 200 OK, 302 Found, 403 Forbidden, 404 Not Found
+	type column struct {
+		title   string
+		color   string
+		results []Result
+	}
+	var columns []column
+
+	// Always add these fixed columns
+	columns = append(columns, column{"Highlighted", cYellow, highlighted})
+	columns = append(columns, column{"200 OK", cGreen, statusGroups[200]})
+	columns = append(columns, column{"302 Found", cYellow, statusGroups[302]})
+	columns = append(columns, column{"403 Forbidden", cRed, statusGroups[403]})
+	columns = append(columns, column{"404 Not Found", cGray, statusGroups[404]})
+
+	// Calculate column width (based on terminal width and number of columns)
+	// Default to 30 chars per column if we have many columns, wider if fewer
+	colWidth := 30
+	if len(columns) <= 2 {
+		colWidth = 45
+	} else if len(columns) <= 3 {
+		colWidth = 35
+	}
+
+	fmt.Printf("\n%sRESULTS%s\n\n", cBold, cReset)
+
+	// Print header row
+	for i, col := range columns {
+		if i > 0 {
+			fmt.Printf("  ")
+		}
+		header := col.title + ":"
+		fmt.Printf("%s%-*s%s", col.color, colWidth, header, cReset)
+	}
+	fmt.Println()
+
+	// Print separator line
+	for i := range columns {
+		if i > 0 {
+			fmt.Printf("  ")
+		}
+		fmt.Printf("%s", strings.Repeat("─", colWidth))
+	}
+	fmt.Println()
+
+	// Print data rows
+	for row := 0; row < maxRows+1; row++ {
+		for i, col := range columns {
+			if i > 0 {
+				fmt.Printf("  ")
+			}
+			color := col.color
+
+			// Get entry for this row
+			var url string
+			var points string
+			displayCount := min(len(col.results), maxRows)
+			if row < displayCount {
+				r := col.results[row]
+				url = r.url
+				points = fmt.Sprintf("(%.4f)", r.points)
+			} else if row == displayCount && len(col.results) > maxRows {
+				// Show overflow indicator at the end
+				url = ""
+				points = fmt.Sprintf("(+%d more)", len(col.results)-maxRows)
+			} else {
+				url = ""
+				points = ""
+			}
+
+			// Print entry with URL in default color and points in column color
+			// Exception: for 404, color the entire entry
+			if url == "" && points == "" {
+				fmt.Printf("%-*s", colWidth, "")
+			} else if col.title == "404 Not Found" {
+				// For 404, color the entire entry
+				entry := url + points
+				fmt.Printf("%s%s%s", color, entry, cReset)
+				remaining := colWidth - len(entry)
+				if remaining > 0 {
+					fmt.Printf("%*s", remaining, "")
+				}
+			} else {
+				// For other columns, color only the points
+				fmt.Printf("%s%s%s%s", url, color, points, cReset)
+				remaining := colWidth - len(url) - len(points)
+				if remaining > 0 {
+					fmt.Printf("%*s", remaining, "")
+				}
+			}
+		}
+		fmt.Println()
+
+		// Check if any column has more data
+		allDone := true
+		for _, col := range columns {
+			displayCount := min(len(col.results), maxRows)
+			hasOverflow := len(col.results) > maxRows
+			maxRowToPrint := displayCount
+			if hasOverflow {
+				maxRowToPrint++ // need one more row for overflow indicator
+			}
+			if row+1 < maxRowToPrint {
+				allDone = false
+				break
+			}
+		}
+		if allDone {
+			break
+		}
+	}
+
+	fmt.Println()
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 func main() {
 	wordlist := flag.String("l", "", "Path to wordlist file")
 	target := flag.String("u", "", "Target URL (e.g. http://example.com)")
-	depth := flag.Int("depth", 3, "Max recursion depth")
+	recursive := flag.Bool("r", false, "Enable recursive scanning")
+	depth := flag.Int("depth", 3, "Max recursion depth (requires -r)")
 	threads := flag.Int("t", 10, "Number of concurrent workers")
 	flag.Parse()
 
 	if *wordlist == "" || *target == "" {
-		fmt.Println("Usage: ft-fuzz -u <url> -l <wordlist> [-depth N] [-t N]")
+		fmt.Println("Usage: ft-fuzz -u <url> -l <wordlist> [-r] [-depth N] [-t N]")
+		fmt.Println("  -r          : Enable recursive scanning")
+		fmt.Println("  -depth N    : Max recursion depth (default: 3, requires -r)")
+		fmt.Println("  -t N        : Number of concurrent workers (default: 10)")
 		os.Exit(1)
 	}
 	if *threads < 1 {
 		*threads = 1
 	}
 
+	// When not recursive, depth is effectively 1 (single-level scan only)
+	effectiveDepth := *depth
+	if !*recursive {
+		effectiveDepth = 1
+	}
+
 	file := openWordlist(*wordlist)
 	words := loadWords(file)
 	file.Close()
 
+	// Calculate request estimates based on recursive/non-recursive mode
 	minReqs := len(words)
-	maxReqs, level := 0, len(words)
-	for i := 0; i < *depth; i++ {
-		maxReqs += level
-		level *= len(words)
+	maxReqs := minReqs
+	if *recursive {
+		maxReqs, level := 0, len(words)
+		for i := 0; i < effectiveDepth; i++ {
+			maxReqs += level
+			level *= len(words)
+		}
 	}
 
 	base := strings.TrimRight(*target, "/")
@@ -431,9 +593,9 @@ func main() {
 	expectedReqs := (maxReqs + minReqs) / 2
 	expectedTime := time.Duration(float64(expectedReqs) * float64(rtt) / float64(*threads))
 
-	printPlan(minReqs, maxReqs, *threads, rtt, expectedTime)
+	printPlan(minReqs, maxReqs, *threads, rtt, expectedTime, *recursive, effectiveDepth, *wordlist)
 
-	p := &Progress{maxReqs: maxReqs, maxDepth: *depth}
+	p := &Progress{maxReqs: maxReqs, maxDepth: effectiveDepth}
 	scan(client, base, words, p, *threads)
 
 	fmt.Printf("\r\033[KDone. Total requests: %d\n\n", p.done.Load())

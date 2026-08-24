@@ -1,0 +1,6 @@
+admin
+api
+login
+test
+config
+backup
