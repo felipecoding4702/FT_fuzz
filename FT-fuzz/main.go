@@ -115,27 +115,31 @@ func score(status int, body string) float64 {
 	return codePoint * keywordPoint * bodyPoint
 }
 
-func newRequest(url string) (*http.Request, error) {
+func newRequest(url string, method string, headers map[string]string, body io.Reader) (*http.Request, error) {
 	/*
-		Builds a GET request with browser-like headers so the traffic looks
-		like a real client instead of Go's default bot UA. Shared by probe()
-		and the RTT calibration so they behave identically.
+		Builds an HTTP request with configurable method, headers, and body.
+		By default uses browser-like headers so the traffic looks like a real client.
 	*/
-	req, err := http.NewRequest("GET", url, nil)
+	req, err := http.NewRequest(method, url, body)
 	if err != nil {
 		return nil, err
 	}
+	// Set default browser headers (can be overridden by custom headers)
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36")
 	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
 	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
+	// Apply custom headers (overrides defaults if key matches)
+	for key, value := range headers {
+		req.Header.Set(key, value)
+	}
 	return req, nil
 }
 
-func probe(client *http.Client, url string) (int, string) {
+func probe(client *http.Client, url string, method string, headers map[string]string, body io.Reader) (int, string) {
 	/*
 		Probing the connection, and retriving both the Status Code and the response body.
 	*/
-	req, err := newRequest(url)
+	req, err := newRequest(url, method, headers, body)
 	if err != nil {
 		return 0, ""
 	}
@@ -143,9 +147,9 @@ func probe(client *http.Client, url string) (int, string) {
 	if err != nil {
 		return 0, ""
 	}
-	body, _ := io.ReadAll(resp.Body)
+	respBody, _ := io.ReadAll(resp.Body)
 	resp.Body.Close()
-	return resp.StatusCode, string(body)
+	return resp.StatusCode, string(respBody)
 }
 
 func measureRTT(client *http.Client, url string) time.Duration {
@@ -158,7 +162,7 @@ func measureRTT(client *http.Client, url string) time.Duration {
 	var total time.Duration
 	hit := 0
 	for i := 0; i < samples; i++ {
-		req, err := newRequest(url)
+		req, err := newRequest(url, "GET", nil, nil)
 		if err != nil {
 			continue
 		}
@@ -191,7 +195,7 @@ func formatDuration(d time.Duration) string {
 	}
 }
 
-func printPlan(minReqs, maxReqs, threads int, rtt, expected time.Duration, recursive bool, depth int, wordlist string) {
+func printPlan(minReqs, maxReqs, threads int, rtt, expected time.Duration, recursive bool, depth int, wordlist string, method string, headers map[string]string, body string) {
 	/*
 		The static "SCAN PLAN" table shown once before the scan starts:
 		min/max request estimates, thread count and the expected wall-clock
@@ -206,9 +210,18 @@ func printPlan(minReqs, maxReqs, threads int, rtt, expected time.Duration, recur
 	fmt.Printf("  %s%s%s\n", cGreen, strings.Repeat("─", 120), cReset)
 	fmt.Printf("  %-20s\t\t\t\t\t\t\t\t\t%s\n", "Scan Wordlist", wordlist)
 	fmt.Printf("  %-20s\t\t\t\t\t\t\t\t\t%s\n", "Highlighted Wordlist", "(not implemented)")
-	fmt.Printf("  %-20s\t\t\t\t\t\t\t\t\t%d\n", "Word List Size", minReqs)
 	fmt.Printf("  %-20s\t\t\t\t\t\t\t\t\t%d\n", "Max requests", maxReqs)
-	fmt.Printf("  %-20s\t\t\t\t\t\t\t\t\t%d\n", "Threads", threads)
+	fmt.Printf("  %-20s\t\t\t\t\t\t\t\t\t%s\n", "Method", method)
+	if len(headers) > 0 {
+		fmt.Printf("  %-20s\t\t\t\t\t\t\t\t\t", "Headers")
+		for k, v := range headers {
+			fmt.Printf("%s: %s ", k, v)
+		}
+		fmt.Println()
+	}
+	if body != "" {
+		fmt.Printf("  %-20s\t\t\t\t\t\t\t\t\t%s\n", "Body", body)
+	}
 	if recursive {
 		fmt.Printf("  %-20s\t\t\t\t\t\t\t\t\t%s (depth: %d)\n", "Mode", "Recursive", depth)
 	} else {
@@ -219,7 +232,7 @@ func printPlan(minReqs, maxReqs, threads int, rtt, expected time.Duration, recur
 	fmt.Println()
 }
 
-func scan(client *http.Client, base string, words []string, p *Progress, threads int) {
+func scan(client *http.Client, base string, words []string, p *Progress, threads int, method string, headers map[string]string, body io.Reader) {
 	/*
 		Concurrent scan. A shared work queue holds individual URLs to probe;
 		`threads` workers pop URLs, fire requests, and enqueue the children of
@@ -281,12 +294,12 @@ func scan(client *http.Client, base string, words []string, p *Progress, threads
 			mu.Unlock()
 
 			// Network I/O happens outside the lock so other workers stay busy.
-			status, body := probe(client, j.url)
-			pts := score(status, body)
+			status, respBody := probe(client, j.url, method, headers, body)
+			pts := score(status, respBody)
 			p.done.Add(1)
 
 			mu.Lock()
-			p.results = append(p.results, Result{j.url, status, len(body), pts})
+			p.results = append(p.results, Result{j.url, status, len(respBody), pts})
 			if (status == 200 || status == 403) && j.depth < p.maxDepth {
 				for _, w := range words {
 					child := j.url + "/" + w
@@ -546,23 +559,53 @@ func min(a, b int) int {
 	return b
 }
 
+func parseHeaders(headerStr string) map[string]string {
+	/*
+		Parses headers from the format "key1:value1,key2:value2"
+		Returns a map of header key-value pairs.
+	*/
+	headers := make(map[string]string)
+	if headerStr == "" {
+		return headers
+	}
+	pairs := strings.Split(headerStr, ",")
+	for _, pair := range pairs {
+		kv := strings.SplitN(pair, ":", 2)
+		if len(kv) == 2 {
+			headers[strings.TrimSpace(kv[0])] = strings.TrimSpace(kv[1])
+		}
+	}
+	return headers
+}
+
 func main() {
 	wordlist := flag.String("l", "", "Path to wordlist file")
 	target := flag.String("u", "", "Target URL (e.g. http://example.com)")
 	recursive := flag.Bool("r", false, "Enable recursive scanning")
 	depth := flag.Int("depth", 3, "Max recursion depth (requires -r)")
 	threads := flag.Int("t", 10, "Number of concurrent workers")
+	method := flag.String("m", "GET", "HTTP method to use (GET, POST, PUT, DELETE, etc.)")
+	headers := flag.String("h", "", "Custom headers in format 'key1:value1,key2:value2'")
+	body := flag.String("b", "", "Request body to send")
 	flag.Parse()
 
 	if *wordlist == "" || *target == "" {
-		fmt.Println("Usage: ft-fuzz -u <url> -l <wordlist> [-r] [-depth N] [-t N]")
+		fmt.Println("Usage: ft-fuzz -u <url> -l <wordlist> [-r] [-depth N] [-t N] [-m METHOD] [-h HEADERS] [-b BODY]")
+		fmt.Println("  -u URL      : Target URL (e.g. http://example.com)")
+		fmt.Println("  -l PATH     : Path to wordlist file")
 		fmt.Println("  -r          : Enable recursive scanning")
 		fmt.Println("  -depth N    : Max recursion depth (default: 3, requires -r)")
 		fmt.Println("  -t N        : Number of concurrent workers (default: 10)")
+		fmt.Println("  -m METHOD   : HTTP method to use (default: GET)")
+		fmt.Println("  -h HEADERS  : Custom headers in format 'key1:value1,key2:value2'")
+		fmt.Println("  -b BODY     : Request body to send")
 		os.Exit(1)
 	}
 	if *threads < 1 {
 		*threads = 1
+	}
+	if *method == "" {
+		*method = "GET"
 	}
 
 	// When not recursive, depth is effectively 1 (single-level scan only)
@@ -574,6 +617,15 @@ func main() {
 	file := openWordlist(*wordlist)
 	words := loadWords(file)
 	file.Close()
+
+	// Parse headers
+	parsedHeaders := parseHeaders(*headers)
+
+	// Prepare request body reader
+	var bodyReader io.Reader
+	if *body != "" {
+		bodyReader = strings.NewReader(*body)
+	}
 
 	// Calculate request estimates based on recursive/non-recursive mode
 	minReqs := len(words)
@@ -593,10 +645,10 @@ func main() {
 	expectedReqs := (maxReqs + minReqs) / 2
 	expectedTime := time.Duration(float64(expectedReqs) * float64(rtt) / float64(*threads))
 
-	printPlan(minReqs, maxReqs, *threads, rtt, expectedTime, *recursive, effectiveDepth, *wordlist)
+	printPlan(minReqs, maxReqs, *threads, rtt, expectedTime, *recursive, effectiveDepth, *wordlist, *method, parsedHeaders, *body)
 
 	p := &Progress{maxReqs: maxReqs, maxDepth: effectiveDepth}
-	scan(client, base, words, p, *threads)
+	scan(client, base, words, p, *threads, *method, parsedHeaders, bodyReader)
 
 	fmt.Printf("\r\033[KDone. Total requests: %d\n\n", p.done.Load())
 	p.renderTables()
