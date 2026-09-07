@@ -1,4 +1,4 @@
-# ft-fuzz
+# FT-FUZZ
 
 A fast, concurrent web directory/content discovery tool written in Go. ft-fuzz probes paths from a wordlist against a target URL, scores how interesting each endpoint is, and can recurse into directories that respond, fanning out a tree of probes up to a configurable depth.
 
