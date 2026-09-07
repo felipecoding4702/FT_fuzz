@@ -115,12 +115,19 @@ func score(status int, body string) float64 {
 	return codePoint * keywordPoint * bodyPoint
 }
 
-func newRequest(url string, method string, headers map[string]string, body io.Reader) (*http.Request, error) {
+func newRequest(url string, method string, headers map[string]string, body string) (*http.Request, error) {
 	/*
 		Builds an HTTP request with configurable method, headers, and body.
 		By default uses browser-like headers so the traffic looks like a real client.
+		A fresh reader is built per call: an io.Reader is consumed by the first
+		request that sends it, so sharing one would leave every later request
+		with an empty body.
 	*/
-	req, err := http.NewRequest(method, url, body)
+	var bodyReader io.Reader
+	if body != "" {
+		bodyReader = strings.NewReader(body)
+	}
+	req, err := http.NewRequest(method, url, bodyReader)
 	if err != nil {
 		return nil, err
 	}
@@ -135,7 +142,7 @@ func newRequest(url string, method string, headers map[string]string, body io.Re
 	return req, nil
 }
 
-func probe(client *http.Client, url string, method string, headers map[string]string, body io.Reader) (int, string) {
+func probe(client *http.Client, url string, method string, headers map[string]string, body string) (int, string) {
 	/*
 		Probing the connection, and retriving both the Status Code and the response body.
 	*/
@@ -162,7 +169,7 @@ func measureRTT(client *http.Client, url string) time.Duration {
 	var total time.Duration
 	hit := 0
 	for i := 0; i < samples; i++ {
-		req, err := newRequest(url, "GET", nil, nil)
+		req, err := newRequest(url, "GET", nil, "")
 		if err != nil {
 			continue
 		}
@@ -232,7 +239,7 @@ func printPlan(minReqs, maxReqs, threads int, rtt, expected time.Duration, recur
 	fmt.Println()
 }
 
-func scan(client *http.Client, base string, words []string, p *Progress, threads int, method string, headers map[string]string, body io.Reader) {
+func scan(client *http.Client, base string, words []string, p *Progress, threads int, method string, headers map[string]string, body string) {
 	/*
 		Concurrent scan. A shared work queue holds individual URLs to probe;
 		`threads` workers pop URLs, fire requests, and enqueue the children of
@@ -621,17 +628,14 @@ func main() {
 	// Parse headers
 	parsedHeaders := parseHeaders(*headers)
 
-	// Prepare request body reader
-	var bodyReader io.Reader
-	if *body != "" {
-		bodyReader = strings.NewReader(*body)
-	}
-
 	// Calculate request estimates based on recursive/non-recursive mode
 	minReqs := len(words)
 	maxReqs := minReqs
 	if *recursive {
-		maxReqs, level := 0, len(words)
+		// Worst case: every probed URL answers 200/403 and spawns a full
+		// level of children — N + N² + … + N^depth requests.
+		level := len(words)
+		maxReqs = 0
 		for i := 0; i < effectiveDepth; i++ {
 			maxReqs += level
 			level *= len(words)
@@ -648,7 +652,7 @@ func main() {
 	printPlan(minReqs, maxReqs, *threads, rtt, expectedTime, *recursive, effectiveDepth, *wordlist, *method, parsedHeaders, *body)
 
 	p := &Progress{maxReqs: maxReqs, maxDepth: effectiveDepth}
-	scan(client, base, words, p, *threads, *method, parsedHeaders, bodyReader)
+	scan(client, base, words, p, *threads, *method, parsedHeaders, *body)
 
 	fmt.Printf("\r\033[KDone. Total requests: %d\n\n", p.done.Load())
 	p.renderTables()

@@ -60,7 +60,7 @@ cd FT_fuzz/FT-fuzz
 go build -o ftfuzz main.go
 ```
 
-Optionally, move the binary onto your `PATH` so you can call `ft-fuzz` from anywhere:
+Optionally, move the binary onto your `PATH` so you can call `ftfuzz` from anywhere:
 
 ```bash
 sudo mv ftfuzz /usr/local/bin/
@@ -69,7 +69,7 @@ sudo mv ftfuzz /usr/local/bin/
 ## Usage
 
 ```bash
-ft-fuzz -u <url> -l <wordlist> [-r] [-depth N] [-t N] [-m METHOD] [-h HEADERS] [-b BODY]
+ftfuzz -u <url> -l <wordlist> [-r] [-depth N] [-t N] [-m METHOD] [-h HEADERS] [-b BODY]
 ```
 
 ### Flags
@@ -100,14 +100,14 @@ ft-fuzz prints a scan plan first (request estimate + ETA from the measured avera
  SCAN PLAN
  ──────────────────────────────────────────────────────
   Scan Wordlist            wordlist.txt
-  Max requests             21
+  Max requests             63
   Method                   GET
   Mode                     Single-level
   Expected time            ~3.2 s   (avg RTT: 305 ms)
  ──────────────────────────────────────────────────────
 
-[████████████████████████████████████████] 100.0% (21/21)
-Done. Total requests: 21
+[████████████████████████████████████████] 100.0% (63/63)
+Done. Total requests: 63
 
 RESULTS
 
@@ -155,3 +155,10 @@ Watched keywords: `admin`, `swagger`, `robots`, `login`, `config`, `backup`, `da
 - Shared state (queue, visited set, results) is guarded by a mutex; a `sync.Cond` wakes idle workers when new work appears. The completed-request counter is atomic so the progress goroutine never contends the lock.
 - All network I/O happens outside the lock; a single goroutine redraws the progress bar so stdout never interleaves.
 
+## Notes
+
+- Before scanning, 3 warm-up GET requests are fired at the target to measure RTT. They aren't included in the request estimates and don't use your custom method/headers/body.
+- Max requests with `-r` is a worst case, so the progress bar may finish below 100% when servers answer 404 early.
+- Header values can't contain commas — the `-h` list splits on `,`.
+- `-h` is taken by custom headers; use `-help` to list all flags.
+- Requests that fail at the network level (e.g. host unreachable) are silently dropped from the results table.
