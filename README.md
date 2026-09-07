@@ -16,13 +16,49 @@ The source code lives in the [`FT-fuzz/`](FT-fuzz/) directory.
 - **Color-coded results** — side-by-side results table grouped by status, with a "Highlighted" column for top-scoring endpoints.
 - **Stealth-ish defaults** — sends browser-like `User-Agent`, `Accept`, and `Accept-Language` headers.
 
-## Build
+## Installation
 
-Requires Go 1.26+.
+### 1. Install Go
+
+ft-fuzz requires Go 1.26 or newer.
+
+**Debian/Ubuntu via apt** — quickest, but the packaged version may be older than 1.26:
 
 ```bash
-cd FT-fuzz
+sudo apt update && sudo apt install -y golang-go
+```
+
+**Official tarball (recommended, works on any Linux distro):**
+
+```bash
+# Check https://go.dev/dl/ for the latest version
+curl -LO https://go.dev/dl/go1.26.3.linux-amd64.tar.gz
+sudo rm -rf /usr/local/go
+sudo tar -C /usr/local -xzf go1.26.3.linux-amd64.tar.gz
+echo 'export PATH=$PATH:/usr/local/go/bin' >> ~/.bashrc
+source ~/.bashrc
+```
+
+Verify the install:
+
+```bash
+go version
+```
+
+### 2. Install ft-fuzz
+
+Clone the repo and build the binary:
+
+```bash
+git clone https://github.com/felipecoding4702/FT_fuzz.git
+cd FT_fuzz/FT-fuzz
 go build -o ftfuzz main.go
+```
+
+Optionally, move the binary onto your `PATH` so you can call `ft-fuzz` from anywhere:
+
+```bash
+sudo mv ftfuzz /usr/local/bin/
 ```
 
 ## Usage
@@ -44,13 +80,41 @@ ft-fuzz -u <url> -l <wordlist> [-r] [-depth N] [-t N] [-m METHOD] [-h HEADERS] [
 | `-h` | — | Custom headers, format `'key1:value1,key2:value2'` |
 | `-b` | — | Request body to send |
 
-### Examples
+## Example
 
-Single-level scan:
+Quick start — scan a target with the bundled wordlist:
 
 ```bash
+cd FT_fuzz/FT-fuzz
 ./ftfuzz -u http://example.com -l wordlist.txt
 ```
+
+ft-fuzz prints a scan plan first (request estimate + ETA from the measured average RTT), runs the scan with a live progress bar, then renders the results table:
+
+```text
+ SCAN PLAN
+ ──────────────────────────────────────────────────────
+  Scan Wordlist            wordlist.txt
+  Max requests             21
+  Method                   GET
+  Mode                     Single-level
+  Expected time            ~3.2 s   (avg RTT: 305 ms)
+ ──────────────────────────────────────────────────────
+
+[████████████████████████████████████████] 100.0% (21/21)
+Done. Total requests: 21
+
+RESULTS
+
+Highlighted:                  200 OK:                   403 Forbidden:             404 Not Found:
+────────────────────────────────────────────────────────────────────────────────────────────────────
+http://…/admin(0.0150)        http://…/login(0.0031)    http://…/config(0.0002)    http://…/about(0.0000)
+http://…/api(0.0122)          http://…/index(0.0028)                               http://…/contact(0.0000)
+```
+
+The most interesting endpoints (green `200`s, keyword hits in the body, larger responses) rise to the top of the **Highlighted** column with their scores. Endpoint names above are illustrative.
+
+### More examples
 
 Recursive scan, 3 levels deep, 20 workers:
 
