@@ -1,16 +1,27 @@
 # FT-FUZZ
 
-A fast, concurrent web directory/content discovery tool written in Go. ft-fuzz probes paths from a wordlist against a target URL, scores how interesting each endpoint is, and can recurse into directories that respond, fanning out a tree of probes up to a configurable depth.
-
-> ⚠️ Use only against systems you are authorized to test.
+A fast, concurrent web directory/content discovery tool written in Go. That return the results based on a point system, giving the user a more readable print.
 
 The source code lives in the [`FT-fuzz/`](FT-fuzz/) directory.
 
+## How results are scored
+
+Each probed endpoint gets a score:
+
+```
+code_point    : 200 -> 1.0, 302 -> 0.5, 403 -> 0.2, everything else -> 0
+keyword_point : 1.5 if any keyword appears in the body, else 1.0
+body_point    : body_size / 100000
+
+total = code_point * keyword_point * body_point
+```
+
 ## Features
+
+- **Scoring system** — every result is ranked by HTTP status, keyword hits in the response body, and body size, so the most interesting endpoints surface first.
 
 - **Concurrent scanning** — configurable worker pool (`-t`), shared work queue, single in-place progress bar.
 - **Recursive discovery** — endpoints answering `200` or `403` become new roots; children are probed down to `-depth` levels (`-r`).
-- **Scoring system** — every result is ranked by HTTP status, keyword hits in the response body, and body size, so the most interesting endpoints surface first.
 - **Flexible requests** — custom HTTP method (`-m`), custom headers (`-h`), and a request body (`-b`).
 - **Scan plan & ETA** — before scanning, it measures average RTT with warm-up requests and prints an estimated request count and wall-clock time.
 - **Color-coded results** — side-by-side results table grouped by status, with a "Highlighted" column for top-scoring endpoints.
@@ -37,12 +48,6 @@ sudo rm -rf /usr/local/go
 sudo tar -C /usr/local -xzf go1.26.3.linux-amd64.tar.gz
 echo 'export PATH=$PATH:/usr/local/go/bin' >> ~/.bashrc
 source ~/.bashrc
-```
-
-Verify the install:
-
-```bash
-go version
 ```
 
 ### 2. Install ft-fuzz
@@ -136,18 +141,6 @@ Plain text, one entry per line. Blank lines and lines starting with `#` are igno
 
 A starter list ships in [`FT-fuzz/wordlist.txt`](FT-fuzz/wordlist.txt).
 
-## How results are scored
-
-Each probed endpoint gets a score:
-
-```
-code_point    : 200 -> 1.0, 302 -> 0.5, 403 -> 0.2, everything else -> 0
-keyword_point : 1.5 if any keyword appears in the body, else 1.0
-body_point    : body_size / 100000
-
-total = code_point * keyword_point * body_point
-```
-
 Watched keywords: `admin`, `swagger`, `robots`, `login`, `config`, `backup`, `dashboard`, `api`, `.git`, `password`.
 
 ## Output
@@ -162,9 +155,3 @@ Watched keywords: `admin`, `swagger`, `robots`, `login`, `config`, `backup`, `da
 - Shared state (queue, visited set, results) is guarded by a mutex; a `sync.Cond` wakes idle workers when new work appears. The completed-request counter is atomic so the progress goroutine never contends the lock.
 - All network I/O happens outside the lock; a single goroutine redraws the progress bar so stdout never interleaves.
 
-## Notes & limitations
-
-- The base URL itself is never probed — it's only the root the tree grows from.
-- Max requests with `-r` grows exponentially: `N + N² + … + N^depth` for a wordlist of `N` words. Budget accordingly.
-- The "Highlighted Wordlist" option shown in the scan plan is not implemented yet.
-- Results are in-memory only; there is no output-file/report export yet.
